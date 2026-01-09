@@ -170,37 +170,15 @@ class WhisperInputService : InputMethodService() {
         recorderManager!!.stop()
 
         CoroutineScope(Dispatchers.Main).launch {
-            val backend = dataStore.data.map { preferences: Preferences ->
-                preferences[SPEECH_TO_TEXT_BACKEND] ?: getString(R.string.settings_option_openai_api)
-            }.first()
-
-            if (backend == getString(R.string.settings_option_gemini_api)) {
-                transcribeWithGeminiChunked(attachToEnd)
-            } else {
-                whisperTranscriber.startAsync(this@WhisperInputService,
-                    recordedAudioFilename,
-                    audioMediaType,
-                    attachToEnd,
-                    { transcriptionCallback(it) },
-                    { transcriptionExceptionCallback(it) })
-            }
+            transcribeWithChunking(attachToEnd)
         }
     }
 
-    private suspend fun transcribeWithGeminiChunked(attachToEnd: String) {
+    private suspend fun transcribeWithChunking(attachToEnd: String) {
         try {
             val audioFile = File(recordedAudioFilename)
             if (!audioFile.exists()) {
-                transcriptionExceptionCallback(getString(R.string.error_endpoint_unset))
-                return
-            }
-
-            val apiKey = dataStore.data.map { preferences: Preferences ->
-                preferences[GEMINI_API_KEY] ?: ""
-            }.first()
-
-            if (apiKey.isEmpty()) {
-                transcriptionExceptionCallback(getString(R.string.error_gemini_apikey_unset))
+                transcriptionExceptionCallback(getString(R.string.error_audio_not_found))
                 return
             }
 
@@ -212,19 +190,33 @@ class WhisperInputService : InputMethodService() {
                 preferences[ADD_TRAILING_SPACE] ?: false
             }.first()
 
-            Log.d(TAG, "Starting Gemini transcription for: ${audioFile.name}")
+            Log.d(TAG, "Starting chunked transcription for: ${audioFile.name}")
 
             val chunks = audioChunker!!.splitAudio(audioFile)
             Log.d(TAG, "Audio split into ${chunks.size} chunks")
 
+            // Note: AudioChunker outputs M4A chunks regardless of input format
+            // (due to MediaMuxer limitations), so we use M4A media type for all chunks
+            val chunkMediaType = AUDIO_MEDIA_TYPE_M4A
+
             val rawText = if (chunks.size == 1) {
                 // Short audio - single API call, no chunking needed
-                whisperTranscriber.transcribeWithGemini(chunks[0].file, apiKey)
+                // For single chunk, use the original file with its original format
+                whisperTranscriber.transcribeChunk(
+                    this@WhisperInputService,
+                    chunks[0].file,
+                    if (chunks[0].file == audioFile) audioMediaType else chunkMediaType
+                )
             } else {
                 // Long audio - parallel chunked transcription
+                // All split chunks are in M4A format
                 val service = ChunkTranscriptionService(
                     transcriber = { chunk ->
-                        whisperTranscriber.transcribeWithGemini(chunk.file, apiKey)
+                        whisperTranscriber.transcribeChunk(
+                            this@WhisperInputService,
+                            chunk.file,
+                            chunkMediaType
+                        )
                     },
                     progressListener = createProgressListener()
                 )
@@ -253,7 +245,7 @@ class WhisperInputService : InputMethodService() {
 
             transcriptionCallback(finalText)
         } catch (e: Exception) {
-            Log.e(TAG, "Gemini transcription failed: ${e.message}", e)
+            Log.e(TAG, "Chunked transcription failed: ${e.message}", e)
             transcriptionExceptionCallback(e.message ?: "Transcription failed")
         }
     }
