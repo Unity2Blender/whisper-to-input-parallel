@@ -21,6 +21,7 @@ package com.example.whispertoinput
 
 import android.inputmethodservice.InputMethodService
 import android.os.Build
+import android.util.Log
 import android.view.View
 import android.content.Intent
 import android.os.IBinder
@@ -29,6 +30,9 @@ import android.view.KeyEvent
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.datastore.preferences.core.Preferences
+import com.example.whispertoinput.chunking.AudioChunker
+import com.example.whispertoinput.chunking.ChunkProgressListener
+import com.example.whispertoinput.chunking.ChunkTranscriptionService
 import com.example.whispertoinput.keyboard.WhisperKeyboard
 import com.example.whispertoinput.recorder.RecorderManager
 import com.github.liuyueyi.quick.transfer.ChineseUtils
@@ -48,9 +52,11 @@ private const val AUDIO_MEDIA_TYPE_OGG = "audio/ogg"
 private const val IME_SWITCH_OPTION_AVAILABILITY_API_LEVEL = 28
 
 class WhisperInputService : InputMethodService() {
+    private val TAG = "WhisperInputService"
     private val whisperKeyboard: WhisperKeyboard = WhisperKeyboard()
     private val whisperTranscriber: WhisperTranscriber = WhisperTranscriber()
     private var recorderManager: RecorderManager? = null
+    private var audioChunker: AudioChunker? = null
     private var recordedAudioFilename: String = ""
     private var audioMediaType: String = AUDIO_MEDIA_TYPE_M4A
     private var useOggFormat: Boolean = false
@@ -95,6 +101,7 @@ class WhisperInputService : InputMethodService() {
     override fun onCreateInputView(): View {
         // Initialize members with regard to this context
         recorderManager = RecorderManager(this)
+        audioChunker = AudioChunker(this)
 
         // Preload conversion table
         ChineseUtils.preLoad(true, TransType.SIMPLE_TO_TAIWAN)
@@ -161,12 +168,134 @@ class WhisperInputService : InputMethodService() {
 
     private fun onStartTranscription(attachToEnd: String) {
         recorderManager!!.stop()
-        whisperTranscriber.startAsync(this,
-            recordedAudioFilename,
-            audioMediaType,
-            attachToEnd,
-            { transcriptionCallback(it) },
-            { transcriptionExceptionCallback(it) })
+
+        CoroutineScope(Dispatchers.Main).launch {
+            val backend = dataStore.data.map { preferences: Preferences ->
+                preferences[SPEECH_TO_TEXT_BACKEND] ?: getString(R.string.settings_option_openai_api)
+            }.first()
+
+            if (backend == getString(R.string.settings_option_gemini_api)) {
+                transcribeWithGeminiChunked(attachToEnd)
+            } else {
+                whisperTranscriber.startAsync(this@WhisperInputService,
+                    recordedAudioFilename,
+                    audioMediaType,
+                    attachToEnd,
+                    { transcriptionCallback(it) },
+                    { transcriptionExceptionCallback(it) })
+            }
+        }
+    }
+
+    private suspend fun transcribeWithGeminiChunked(attachToEnd: String) {
+        try {
+            val audioFile = File(recordedAudioFilename)
+            if (!audioFile.exists()) {
+                transcriptionExceptionCallback(getString(R.string.error_endpoint_unset))
+                return
+            }
+
+            val apiKey = dataStore.data.map { preferences: Preferences ->
+                preferences[GEMINI_API_KEY] ?: ""
+            }.first()
+
+            if (apiKey.isEmpty()) {
+                transcriptionExceptionCallback(getString(R.string.error_gemini_apikey_unset))
+                return
+            }
+
+            val postprocessing = dataStore.data.map { preferences: Preferences ->
+                preferences[POSTPROCESSING] ?: getString(R.string.settings_option_no_conversion)
+            }.first()
+
+            val addTrailingSpace = dataStore.data.map { preferences: Preferences ->
+                preferences[ADD_TRAILING_SPACE] ?: false
+            }.first()
+
+            Log.d(TAG, "Starting Gemini transcription for: ${audioFile.name}")
+
+            val chunks = audioChunker!!.splitAudio(audioFile)
+            Log.d(TAG, "Audio split into ${chunks.size} chunks")
+
+            val rawText = if (chunks.size == 1) {
+                // Short audio - single API call, no chunking needed
+                whisperTranscriber.transcribeWithGemini(chunks[0].file, apiKey)
+            } else {
+                // Long audio - parallel chunked transcription
+                val service = ChunkTranscriptionService(
+                    transcriber = { chunk ->
+                        whisperTranscriber.transcribeWithGemini(chunk.file, apiKey)
+                    },
+                    progressListener = createProgressListener()
+                )
+                service.transcribe(chunks)
+            }
+
+            // Apply postprocessing
+            val processedText = when (postprocessing) {
+                getString(R.string.settings_option_to_simplified) -> ChineseUtils.tw2s(rawText)
+                getString(R.string.settings_option_to_traditional) -> ChineseUtils.s2tw(rawText)
+                else -> rawText
+            }
+
+            // Apply trailing space or attachment
+            val finalText = if (attachToEnd.isEmpty()) {
+                processedText + if (addTrailingSpace) " " else ""
+            } else {
+                processedText + attachToEnd
+            }
+
+            // Clean up chunk files
+            audioChunker?.cleanup(chunks)
+
+            // Clean up original audio file
+            audioFile.delete()
+
+            transcriptionCallback(finalText)
+        } catch (e: Exception) {
+            Log.e(TAG, "Gemini transcription failed: ${e.message}", e)
+            transcriptionExceptionCallback(e.message ?: "Transcription failed")
+        }
+    }
+
+    private fun createProgressListener(): ChunkProgressListener {
+        return object : ChunkProgressListener {
+            override fun onChunkingStarted(totalChunks: Int) {
+                runOnMainThread {
+                    whisperKeyboard.updateStatusText(getString(R.string.splitting_audio))
+                }
+            }
+
+            override fun onChunkStarted(index: Int) {
+                // No action needed
+            }
+
+            override fun onChunkCompleted(index: Int, completed: Int, total: Int) {
+                runOnMainThread {
+                    whisperKeyboard.updateStatusText(getString(R.string.transcribing_chunk, completed, total))
+                }
+            }
+
+            override fun onChunkFailed(index: Int, error: Exception) {
+                Log.w(TAG, "Chunk $index failed: ${error.message}")
+            }
+
+            override fun onMergingStarted() {
+                runOnMainThread {
+                    whisperKeyboard.updateStatusText(getString(R.string.merging_chunks))
+                }
+            }
+
+            override fun onTranscriptionComplete(text: String) {
+                // Progress will be reset by transcriptionCallback
+            }
+        }
+    }
+
+    private fun runOnMainThread(action: () -> Unit) {
+        CoroutineScope(Dispatchers.Main).launch {
+            action()
+        }
     }
 
     private fun onCancelTranscription() {
