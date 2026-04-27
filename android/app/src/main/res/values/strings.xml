@@ -49,6 +49,7 @@
     <string name="settings_option_nvidia_nim_default_language">multi</string> <!-- Empty default language -->
     <string name="settings_option_gemini_api">Gemini API</string>
     <string name="settings_option_gemini_api_default_endpoint">https://generativelanguage.googleapis.com/v1beta</string>
+    <string name="settings_option_gemini_api_default_model">gemini-3.1-flash-lite-preview</string>
     <string-array name="settings_speech_to_text_backend_array">
         <item>@string/settings_option_openai_api</item>
         <item>@string/settings_option_whisper_asr_webservice</item>
@@ -90,6 +91,11 @@
         <item>@string/settings_option_yes</item>
         <item>@string/settings_option_no</item>
     </string-array>
+    <string name="settings_diagnostics">Diagnostics</string>
+    <string name="settings_diagnostics_desc">Copy plain-text logs of the last 5 transcription attempts (per-chunk size, HTTP code, retries, retry-after, timing). API keys are redacted.</string>
+    <string name="copy_diagnostic_logs">Copy Diagnostic Logs (last 5)</string>
+    <string name="diagnostic_logs_copied">Logs copied to clipboard</string>
+
     <string name="settings_postprocessing">Postprocessing</string>
     <string name="settings_postprocessing_desc">Choose how to handle text postprocessing.</string>
     <string name="settings_option_to_traditional">Convert to Traditional Chinese</string>

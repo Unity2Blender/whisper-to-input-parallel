@@ -161,4 +161,15 @@ class AudioChunker(private val context: Context) {
             }
         }
     }
+
+    fun sweepStaleChunks(maxAgeMs: Long = ChunkConfig.STALE_CHUNK_MAX_AGE_MS) {
+        val cutoff = System.currentTimeMillis() - maxAgeMs
+        val cacheDir = context.cacheDir ?: return
+        val stale = cacheDir.listFiles { f ->
+            f.isFile && f.name.startsWith("chunk_") && f.name.endsWith(".m4a") && f.lastModified() < cutoff
+        } ?: return
+        stale.forEach {
+            if (it.delete()) Log.d(TAG, "Swept stale chunk: ${it.name}")
+        }
+    }
 }

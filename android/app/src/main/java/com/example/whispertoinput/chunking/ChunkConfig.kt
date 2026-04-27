@@ -23,7 +23,9 @@ object ChunkConfig {
     const val CHUNK_DURATION_SECONDS = 30
     const val CHUNK_OVERLAP_SECONDS = 2
     const val CHUNKING_THRESHOLD_SECONDS = 30
-    const val MAX_CONCURRENT_CHUNKS = 3
+    const val MAX_CONCURRENT_CHUNKS = 4
     const val MAX_RETRIES = 3
-    const val RETRY_DELAY_MS = 1500L
+    const val RETRY_BASE_DELAY_MS = 1500L
+    const val RETRY_MAX_DELAY_MS = 30_000L
+    const val STALE_CHUNK_MAX_AGE_MS = 5L * 60_000L
 }

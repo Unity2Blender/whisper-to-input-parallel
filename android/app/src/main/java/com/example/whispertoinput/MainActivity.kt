@@ -20,6 +20,8 @@
 package com.example.whispertoinput
 
 import androidx.appcompat.app.AppCompatActivity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.os.Bundle
 import androidx.core.app.ActivityCompat
 import android.Manifest
@@ -34,6 +36,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.Spinner
 import android.widget.Toast
+import com.example.whispertoinput.diagnostics.TranscriptionLogStore
 import androidx.core.content.ContextCompat
 import androidx.core.widget.doOnTextChanged
 import androidx.datastore.core.DataStore
@@ -72,7 +75,17 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         setupSettingItems()
+        setupDiagnosticsButton()
         checkPermissions()
+    }
+
+    private fun setupDiagnosticsButton() {
+        findViewById<Button>(R.id.btn_copy_diagnostic_logs).setOnClickListener {
+            val text = TranscriptionLogStore.readAsPlainText(this)
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("Whisper-To-Input Logs", text))
+            Toast.makeText(this, R.string.diagnostic_logs_copied, Toast.LENGTH_SHORT).show()
+        }
     }
 
     // The onClick event of the grant permission button.
@@ -289,6 +302,8 @@ class MainActivity : AppCompatActivity() {
                             } else if (selectedItem == getString(R.string.settings_option_gemini_api)) {
                                 val endpointEditText: EditText = findViewById<EditText>(R.id.field_endpoint)
                                 endpointEditText.setText(getString(R.string.settings_option_gemini_api_default_endpoint))
+                                val modelEditText: EditText = findViewById<EditText>(R.id.field_model)
+                                modelEditText.setText(getString(R.string.settings_option_gemini_api_default_model))
                             }
                         }
                     }

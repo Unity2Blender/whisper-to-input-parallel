@@ -85,9 +85,15 @@ class RecorderManager(context: Context) {
                 setOutputFormat(MediaRecorder.OutputFormat.OGG)
                 setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
             } else {
-                // Use M4A format for other backends
+                // AAC in M4A — listed in Gemini's supported audio MIME types (audio/mp4 + AAC).
+                // Older AMR-NB encoder is not in Gemini's supported list, leading to silent
+                // rejection / mis-decode and 429 retry storms.
+                // 16 kHz mono matches Gemini's internal downsample target; 24 kbps is enough for ASR.
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(16_000)
+                setAudioEncodingBitRate(24_000)
+                setAudioChannels(1)
             }
             setOutputFile(filename)
 

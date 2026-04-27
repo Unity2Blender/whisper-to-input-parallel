@@ -30,9 +30,14 @@ import android.view.KeyEvent
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.datastore.preferences.core.Preferences
+import com.example.whispertoinput.chunking.AudioChunk
 import com.example.whispertoinput.chunking.AudioChunker
 import com.example.whispertoinput.chunking.ChunkProgressListener
 import com.example.whispertoinput.chunking.ChunkTranscriptionService
+import com.example.whispertoinput.chunking.ChunkedTranscriptionException
+import com.example.whispertoinput.diagnostics.ChunkLogLine
+import com.example.whispertoinput.diagnostics.TranscriptionEntry
+import com.example.whispertoinput.diagnostics.TranscriptionLogStore
 import com.example.whispertoinput.keyboard.WhisperKeyboard
 import com.example.whispertoinput.recorder.RecorderManager
 import com.github.liuyueyi.quick.transfer.ChineseUtils
@@ -102,6 +107,9 @@ class WhisperInputService : InputMethodService() {
         // Initialize members with regard to this context
         recorderManager = RecorderManager(this)
         audioChunker = AudioChunker(this)
+
+        // Sweep any orphaned chunk files left from prior IME crashes / dismissals.
+        audioChunker?.sweepStaleChunks()
 
         // Preload conversion table
         ChineseUtils.preLoad(true, TransType.SIMPLE_TO_TAIWAN)
@@ -175,9 +183,17 @@ class WhisperInputService : InputMethodService() {
     }
 
     private suspend fun transcribeWithChunking(attachToEnd: String) {
+        val audioFile = File(recordedAudioFilename)
+        val started = System.currentTimeMillis()
+        var chunks: List<AudioChunk> = emptyList()
+        var chunkLogLines: List<ChunkLogLine> = emptyList()
+        var outcome = "OK"
+        var backendForLog = "?"
+        var modelForLog = ""
+
         try {
-            val audioFile = File(recordedAudioFilename)
             if (!audioFile.exists()) {
+                outcome = "FAIL: audio file missing"
                 transcriptionExceptionCallback(getString(R.string.error_audio_not_found))
                 return
             }
@@ -190,26 +206,46 @@ class WhisperInputService : InputMethodService() {
                 preferences[ADD_TRAILING_SPACE] ?: false
             }.first()
 
+            backendForLog = dataStore.data.map { preferences: Preferences ->
+                preferences[SPEECH_TO_TEXT_BACKEND] ?: getString(R.string.settings_option_openai_api)
+            }.first()
+            modelForLog = dataStore.data.map { preferences: Preferences ->
+                preferences[MODEL] ?: ""
+            }.first()
+            if (backendForLog == getString(R.string.settings_option_gemini_api) && modelForLog.isBlank()) {
+                modelForLog = WhisperTranscriber.DEFAULT_GEMINI_MODEL
+            }
+
             Log.d(TAG, "Starting chunked transcription for: ${audioFile.name}")
 
-            val chunks = audioChunker!!.splitAudio(audioFile)
+            chunks = audioChunker!!.splitAudio(audioFile)
             Log.d(TAG, "Audio split into ${chunks.size} chunks")
 
-            // Note: AudioChunker outputs M4A chunks regardless of input format
-            // (due to MediaMuxer limitations), so we use M4A media type for all chunks
+            // AudioChunker outputs M4A chunks regardless of input format (MediaMuxer limitation),
+            // so use M4A media type for any post-split chunk.
             val chunkMediaType = AUDIO_MEDIA_TYPE_M4A
 
-            val rawText = if (chunks.size == 1) {
-                // Short audio - single API call, no chunking needed
-                // For single chunk, use the original file with its original format
-                whisperTranscriber.transcribeChunk(
+            val rawText: String = if (chunks.size == 1) {
+                val isOriginalFile = chunks[0].file == audioFile
+                val singleStarted = System.currentTimeMillis()
+                val result = whisperTranscriber.transcribeChunk(
                     this@WhisperInputService,
                     chunks[0].file,
-                    if (chunks[0].file == audioFile) audioMediaType else chunkMediaType
+                    if (isOriginalFile) audioMediaType else chunkMediaType
                 )
+                chunkLogLines = listOf(
+                    ChunkLogLine(
+                        index = 0,
+                        total = 1,
+                        sizeBytes = result.sizeBytes,
+                        httpCode = result.httpCode,
+                        retries = 0,
+                        retryAfterMs = null,
+                        durationMs = System.currentTimeMillis() - singleStarted
+                    )
+                )
+                result.text
             } else {
-                // Long audio - parallel chunked transcription
-                // All split chunks are in M4A format
                 val service = ChunkTranscriptionService(
                     transcriber = { chunk ->
                         whisperTranscriber.transcribeChunk(
@@ -220,33 +256,55 @@ class WhisperInputService : InputMethodService() {
                     },
                     progressListener = createProgressListener()
                 )
-                service.transcribe(chunks)
+                val runResult = service.transcribe(chunks)
+                chunkLogLines = runResult.chunkLogLines
+                runResult.mergedText
             }
 
-            // Apply postprocessing
             val processedText = when (postprocessing) {
                 getString(R.string.settings_option_to_simplified) -> ChineseUtils.tw2s(rawText)
                 getString(R.string.settings_option_to_traditional) -> ChineseUtils.s2tw(rawText)
                 else -> rawText
             }
 
-            // Apply trailing space or attachment
             val finalText = if (attachToEnd.isEmpty()) {
                 processedText + if (addTrailingSpace) " " else ""
             } else {
                 processedText + attachToEnd
             }
 
-            // Clean up chunk files
-            audioChunker?.cleanup(chunks)
-
-            // Clean up original audio file
-            audioFile.delete()
-
             transcriptionCallback(finalText)
-        } catch (e: Exception) {
+        } catch (e: ChunkedTranscriptionException) {
+            chunkLogLines = e.chunkLogLines
+            outcome = "FAIL: ${e.message?.take(200)}"
             Log.e(TAG, "Chunked transcription failed: ${e.message}", e)
             transcriptionExceptionCallback(e.message ?: "Transcription failed")
+        } catch (e: Exception) {
+            outcome = "FAIL: ${e.message?.take(200)}"
+            Log.e(TAG, "Chunked transcription failed: ${e.message}", e)
+            transcriptionExceptionCallback(e.message ?: "Transcription failed")
+        } finally {
+            try {
+                if (chunks.isNotEmpty()) audioChunker?.cleanup(chunks)
+                audioFile.delete()
+                val totalMs = System.currentTimeMillis() - started
+                withContext(Dispatchers.IO) {
+                    TranscriptionLogStore.append(
+                        this@WhisperInputService,
+                        TranscriptionEntry(
+                            timestamp = started,
+                            backend = backendForLog,
+                            model = modelForLog,
+                            totalChunks = chunks.size,
+                            totalMs = totalMs,
+                            outcome = outcome,
+                            chunkLines = chunkLogLines
+                        )
+                    )
+                }
+            } catch (cleanupError: Exception) {
+                Log.w(TAG, "Cleanup/logging failed: ${cleanupError.message}")
+            }
         }
     }
 

@@ -52,9 +52,22 @@ WhisperInputService (InputMethodService)
 
 ### Backend Support
 
-- **OpenAI API**: Bearer token auth, M4A audio format
-- **Whisper ASR Webservice**: No auth, self-hosted
-- **NVIDIA NIM**: Multi-language support, OGG audio format
+- **OpenAI API**: Bearer token auth, M4A (AAC) audio format
+- **Whisper ASR Webservice**: No auth, self-hosted, M4A (AAC)
+- **NVIDIA NIM**: Multi-language support, OGG/Opus audio format
+- **Google Gemini API**: `?key=` query auth, M4A (AAC) audio inline base64 via `generateContent`. Model is read from the `MODEL` Settings field; default `gemini-3.1-flash-lite-preview` if blank. Hard-coded constants live in `WhisperTranscriber.kt` companion object.
+
+### Recording format
+
+All M4A backends record AAC at 16 kHz mono, 24 kbps (`RecorderManager.kt`). NVIDIA NIM uses its own OGG/Opus path. AMR-NB is not used — Gemini's documented audio support does not include it.
+
+### Chunked parallel transcription
+
+Long recordings (> `CHUNKING_THRESHOLD_SECONDS`) are split into overlapping chunks and transcribed in parallel via `chunking/ChunkTranscriptionService` (semaphore-bounded at `MAX_CONCURRENT_CHUNKS=4`). Per-chunk retries respect `Retry-After` and Gemini's `RetryInfo.retryDelay`; full-jitter exponential backoff. Any chunk failure aborts the whole transcription (fail-loudly).
+
+### Diagnostics
+
+`diagnostics/TranscriptionLogStore` keeps a 5-entry ring buffer of structured per-chunk log lines at `filesDir/transcription_logs.json`. Settings → "Copy Diagnostic Logs" copies a plain-text dump to the clipboard. API keys / Bearer tokens are redacted before write.
 
 ## Configuration
 

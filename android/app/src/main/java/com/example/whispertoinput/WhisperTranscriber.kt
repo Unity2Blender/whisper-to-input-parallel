@@ -1,7 +1,7 @@
 /*
  * This file is part of Whisper To Input, see <https://github.com/j3soon/whisper-to-input>.
  *
- * Copyright (c) 2023-2025 Yan-Bin Diau, Johnson Sun
+ * Copyright (c) 2023-2026 Yan-Bin Diau, Johnson Sun
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -52,6 +52,18 @@ class WhisperTranscriber {
         val addTrailingSpace: Boolean
     )
 
+    companion object {
+        private val sharedHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
+                .writeTimeout(120, TimeUnit.SECONDS)
+                .build()
+        }
+        const val DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+        const val GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+    }
+
     private val TAG = "WhisperTranscriber"
     private var currentTranscriptionJob: Job? = null
 
@@ -64,7 +76,6 @@ class WhisperTranscriber {
         exceptionCallback: (String) -> Unit
     ) {
         suspend fun makeWhisperRequest(): String {
-            // Retrieve configs
             val (endpoint, languageCode, speechToTextBackend, apiKey, model, postprocessing, addTrailingSpace) = context.dataStore.data.map { preferences: Preferences ->
                 Config(
                     preferences[ENDPOINT] ?: "",
@@ -77,13 +88,10 @@ class WhisperTranscriber {
                 )
             }.first()
 
-            // Foolproof message
             if (endpoint == "") {
                 throw Exception(context.getString(R.string.error_endpoint_unset))
             }
 
-            // Make request
-            val client = OkHttpClient()
             val request = buildWhisperRequest(
                 context,
                 filename,
@@ -94,62 +102,47 @@ class WhisperTranscriber {
                 apiKey,
                 model
             )
-            val response = client.newCall(request).execute()
+            val response = sharedHttpClient.newCall(request).execute()
 
-            // If request is not successful, or response code is weird
             if (!response.isSuccessful || response.code / 100 != 2) {
                 throw Exception(response.body!!.string().replace('\n', ' '))
             }
 
             var rawText = response.body!!.string().trim()
-            
-            // For NVIDIA NIM, remove quotes if they wrap the text
-            // Not sure if this is a bug or a feature...
-            if (speechToTextBackend == context.getString(R.string.settings_option_nvidia_nim) && 
+
+            if (speechToTextBackend == context.getString(R.string.settings_option_nvidia_nim) &&
                 rawText.startsWith("\"") && rawText.endsWith("\"")) {
                 rawText = rawText.substring(1, rawText.length - 1).trim()
             }
-            
+
             val processedText = when (postprocessing) {
                 context.getString(R.string.settings_option_to_simplified) -> ChineseUtils.tw2s(rawText)
                 context.getString(R.string.settings_option_to_traditional) -> ChineseUtils.s2tw(rawText)
-                else -> rawText // No conversion
+                else -> rawText
             }
 
-            if (attachToEnd == "") {
-                return processedText + if (addTrailingSpace) " " else ""
+            return if (attachToEnd == "") {
+                processedText + if (addTrailingSpace) " " else ""
             } else {
-                // Only used for space key and enter key.
-                return processedText + attachToEnd
+                processedText + attachToEnd
             }
         }
 
-        // Create a cancellable job in the main thread (for UI updating)
         val job = CoroutineScope(Dispatchers.Main).launch {
-
-            // Within the job, make a suspend call at the I/O thread
-            // It suspends before result is obtained.
-            // Returns (transcribed string, exception message)
             val (transcribedText, exceptionMessage) = withContext(Dispatchers.IO) {
                 try {
-                    // Perform transcription here
                     val response = makeWhisperRequest()
-                    // Clean up unused audio file after transcription
-                    // Ref: https://developer.android.com/reference/android/media/MediaRecorder#setOutputFile(java.io.File)
                     File(filename).delete()
                     return@withContext Pair(response, null)
                 } catch (e: CancellationException) {
-                    // Task was canceled
                     return@withContext Pair(null, null)
                 } catch (e: Exception) {
                     return@withContext Pair(null, e.message)
                 }
             }
 
-            // This callback is within the main thread.
             callback.invoke(transcribedText)
 
-            // If exception message is not null
             if (!exceptionMessage.isNullOrEmpty()) {
                 Log.e(TAG, exceptionMessage)
                 exceptionCallback(exceptionMessage)
@@ -178,44 +171,18 @@ class WhisperTranscriber {
         apiKey: String,
         model: String
     ): Request {
-        // Please refer to the following for the endpoint/payload definitions:
-        // OpenAI API:
-        // - https://platform.openai.com/docs/api-reference/audio/createTranscription
-        // - https://platform.openai.com/docs/api-reference/making-requests
-        // Whisper ASR WebService:
-        // - https://ahmetoner.com/whisper-asr-webservice/run/#usage
-        // NVIDIA NIM:
-        // - No public documentation for HTTP-style requests.
-        // - Source code at `/opt/nim/inference.py` in docker container `nvcr.io/nim/nvidia/riva-asr:1.3.0`.
-        /*
-            ...
-            @HttpNIMApiInterface.route('/v1/audio/transcriptions', methods=["post"])
-            async def transcriptions(
-                self,
-                file: UploadFile = File(...),
-                model: Optional[str] = Form(None),
-                language: Optional[str] = Form(None),
-                prompt: Optional[str] = Form(None),
-                response_format: Optional[str] = Form(None),
-                temperature: Optional[float] = Form(None),
-            ):
-            ...
-         */
         val file: File = File(filename)
         val fileBody: RequestBody = file.asRequestBody(mediaType.toMediaTypeOrNull())
         val requestBody: RequestBody = MultipartBody.Builder().apply {
             setType(MultipartBody.FORM)
-            // Determine filename based on media type
             val formDataFilename = if (mediaType == "audio/ogg") "@audio.ogg" else "@audio.m4a"
-            
-            // Add file to payload
-            if (speechToTextBackend == context.getString(R.string.settings_option_openai_api) || 
+
+            if (speechToTextBackend == context.getString(R.string.settings_option_openai_api) ||
                 speechToTextBackend == context.getString(R.string.settings_option_nvidia_nim)) {
                 addFormDataPart("file", formDataFilename, fileBody)
             } else if (speechToTextBackend == context.getString(R.string.settings_option_whisper_asr_webservice)) {
                 addFormDataPart("audio_file", formDataFilename, fileBody)
             }
-            // Add backend-specific parameters to payload
             if (speechToTextBackend == context.getString(R.string.settings_option_openai_api)) {
                 addFormDataPart("model", model)
                 addFormDataPart("response_format", "text")
@@ -228,7 +195,6 @@ class WhisperTranscriber {
 
         val requestHeaders: Headers = Headers.Builder().apply {
             if (speechToTextBackend == context.getString(R.string.settings_option_openai_api)) {
-                // Foolproof message
                 if (apiKey == "") {
                     throw Exception(context.getString(R.string.error_apikey_unset))
                 }
@@ -237,7 +203,6 @@ class WhisperTranscriber {
             add("Content-Type", "multipart/form-data")
         }.build()
 
-        // Build URL with endpoint-specific parameters
         val url = when (speechToTextBackend) {
             context.getString(R.string.settings_option_openai_api),
             context.getString(R.string.settings_option_whisper_asr_webservice) -> {
@@ -255,11 +220,14 @@ class WhisperTranscriber {
 
     suspend fun transcribeWithGemini(
         audioFile: File,
-        apiKey: String
-    ): String = withContext(Dispatchers.IO) {
-        Log.d(TAG, "Transcribing with Gemini: ${audioFile.name}")
+        apiKey: String,
+        model: String
+    ): ChunkResult = withContext(Dispatchers.IO) {
+        val resolvedModel = model.ifBlank { DEFAULT_GEMINI_MODEL }
+        Log.d(TAG, "Transcribing with Gemini (model=$resolvedModel): ${audioFile.name}")
 
         val audioData = audioFile.readBytes()
+        val sizeBytes = audioData.size
         val base64Audio = Base64.encodeToString(audioData, Base64.NO_WRAP)
 
         val jsonBody = JSONObject().apply {
@@ -278,22 +246,25 @@ class WhisperTranscriber {
             })
         }
 
-        val client = OkHttpClient.Builder()
-            .connectTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
-            .build()
-
         val request = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$apiKey")
+            .url("$GEMINI_BASE_URL/$resolvedModel:generateContent?key=$apiKey")
             .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        val response = client.newCall(request).execute()
+        val started = System.currentTimeMillis()
+        val response = sharedHttpClient.newCall(request).execute()
+        val durationMs = System.currentTimeMillis() - started
 
-        if (!response.isSuccessful || response.code / 100 != 2) {
+        val httpCode = response.code
+        if (!response.isSuccessful || httpCode / 100 != 2) {
             val errorBody = response.body?.string() ?: "Unknown error"
-            throw Exception("Gemini API error (${response.code}): $errorBody")
+            val retryAfterMs = parseRetryAfterMs(response.headers, errorBody)
+            throw GeminiHttpException(
+                statusCode = httpCode,
+                retryAfterMs = retryAfterMs,
+                errorBody = errorBody,
+                message = "Gemini API error ($httpCode): ${errorBody.take(300)}"
+            )
         }
 
         val responseBody = response.body?.string() ?: throw Exception("Empty response from Gemini API")
@@ -307,21 +278,15 @@ class WhisperTranscriber {
             .getString("text")
             .trim()
 
-        Log.d(TAG, "Gemini transcription result: ${text.take(100)}...")
-        text
+        Log.d(TAG, "Gemini transcription result (${durationMs}ms): ${text.take(100)}...")
+        ChunkResult(text = text, httpCode = httpCode, sizeBytes = sizeBytes, durationMs = durationMs)
     }
 
-    /**
-     * Transcribe a single audio chunk using the configured backend.
-     * This is a backend-agnostic function that routes to the appropriate API.
-     * Returns raw transcription text (no postprocessing applied).
-     */
     suspend fun transcribeChunk(
         context: Context,
         audioFile: File,
         mediaType: String
-    ): String = withContext(Dispatchers.IO) {
-        // Retrieve configs
+    ): ChunkResult = withContext(Dispatchers.IO) {
         val (endpoint, languageCode, speechToTextBackend, apiKey, model, _, _) = context.dataStore.data.map { preferences: Preferences ->
             Config(
                 preferences[ENDPOINT] ?: "",
@@ -336,7 +301,6 @@ class WhisperTranscriber {
 
         Log.d(TAG, "Transcribing chunk with backend: $speechToTextBackend")
 
-        // Route to appropriate backend
         when (speechToTextBackend) {
             context.getString(R.string.settings_option_gemini_api) -> {
                 val geminiApiKey = context.dataStore.data.map { preferences: Preferences ->
@@ -345,20 +309,14 @@ class WhisperTranscriber {
                 if (geminiApiKey.isEmpty()) {
                     throw Exception(context.getString(R.string.error_gemini_apikey_unset))
                 }
-                transcribeWithGemini(audioFile, geminiApiKey)
+                transcribeWithGemini(audioFile, geminiApiKey, model)
             }
             else -> {
-                // OpenAI, Whisper ASR, NVIDIA NIM - use existing HTTP multipart flow
                 if (endpoint.isEmpty()) {
                     throw Exception(context.getString(R.string.error_endpoint_unset))
                 }
 
-                val client = OkHttpClient.Builder()
-                    .connectTimeout(60, TimeUnit.SECONDS)
-                    .readTimeout(60, TimeUnit.SECONDS)
-                    .writeTimeout(60, TimeUnit.SECONDS)
-                    .build()
-
+                val sizeBytes = audioFile.length().toInt()
                 val request = buildWhisperRequest(
                     context,
                     audioFile.absolutePath,
@@ -370,22 +328,64 @@ class WhisperTranscriber {
                     model
                 )
 
-                val response = client.newCall(request).execute()
+                val started = System.currentTimeMillis()
+                val response = sharedHttpClient.newCall(request).execute()
+                val durationMs = System.currentTimeMillis() - started
+                val httpCode = response.code
 
-                if (!response.isSuccessful || response.code / 100 != 2) {
-                    throw Exception(response.body?.string()?.replace('\n', ' ') ?: "Unknown error")
+                if (!response.isSuccessful || httpCode / 100 != 2) {
+                    throw Exception(
+                        "${speechToTextBackend} error ($httpCode): " +
+                            (response.body?.string()?.replace('\n', ' ') ?: "Unknown error")
+                    )
                 }
 
                 var rawText = response.body?.string()?.trim() ?: ""
-
-                // For NVIDIA NIM, remove quotes if they wrap the text
                 if (speechToTextBackend == context.getString(R.string.settings_option_nvidia_nim) &&
                     rawText.startsWith("\"") && rawText.endsWith("\"")) {
                     rawText = rawText.substring(1, rawText.length - 1).trim()
                 }
 
-                rawText
+                ChunkResult(text = rawText, httpCode = httpCode, sizeBytes = sizeBytes, durationMs = durationMs)
             }
         }
     }
+
+    private fun parseRetryAfterMs(headers: Headers, errorBody: String?): Long? {
+        headers["Retry-After"]?.toLongOrNull()?.let { return it * 1000L }
+        if (errorBody.isNullOrBlank()) return null
+        return try {
+            val root = JSONObject(errorBody)
+            val error = root.optJSONObject("error") ?: return null
+            val details = error.optJSONArray("details") ?: return null
+            for (i in 0 until details.length()) {
+                val item = details.optJSONObject(i) ?: continue
+                val type = item.optString("@type")
+                if (type.endsWith("RetryInfo")) {
+                    val retryDelay = item.optString("retryDelay")
+                    if (retryDelay.isNotBlank() && retryDelay.endsWith("s")) {
+                        val seconds = retryDelay.removeSuffix("s").toDoubleOrNull() ?: continue
+                        return (seconds * 1000).toLong()
+                    }
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
 }
+
+data class ChunkResult(
+    val text: String,
+    val httpCode: Int,
+    val sizeBytes: Int,
+    val durationMs: Long
+)
+
+class GeminiHttpException(
+    val statusCode: Int,
+    val retryAfterMs: Long?,
+    val errorBody: String?,
+    message: String
+) : Exception(message)
